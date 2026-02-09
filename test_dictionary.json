@@ -1,0 +1,12 @@
+{
+  "version": "1.1",
+  "messages": {
+    "331898": { "fmt": "System initialized", "args": "", "file": "main.zig", "line": 70 },
+    "414451": { "fmt": "Cold reset - Application starting", "args": "", "file": "main.zig", "line": 25 },
+    "1016184": { "fmt": "Warm reset (count={d})", "args": "u32", "file": "reset.zig", "line": 12 },
+    "109126": { "fmt": "LED toggled", "args": "", "file": "led.zig", "line": 42 },
+    "1048476": { "fmt": "GPIO port {d} pin {d} initialized", "args": "u8u8", "file": "gpio.zig", "line": 88 },
+    "123456": { "fmt": "Temperature: {d} C, Humidity: {d}%", "args": "i16u8", "file": "sensor.zig", "line": 156 },
+    "789012": { "fmt": "Sensor value: 0x{X}", "args": "u32", "file": "sensor.zig", "line": 200 }
+  }
+}

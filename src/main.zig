@@ -1,4 +1,109 @@
 const std = @import("std");
+const Dictionary = @import("dictionary.zig").Dictionary;
+const FrameDecoder = @import("decoder.zig").FrameDecoder;
+const output = @import("output.zig");
+
+const cfg_file = "zrtt_viewer_cfg.ini";
+
+const usage =
+    \\Usage: zRttViewer [dictionary.json] [options]
+    \\       zRttViewer [dictionary.json] --file <binary_log_file>
+    \\
+    \\Options:
+    \\  --file <path>   Read from binary log file instead of JLinkRTTLogger
+    \\  --raw           Raw text mode: display RTT data as text (no decoding)
+    \\  --help          Show this help message
+    \\
+    \\If no dictionary is specified, the last used dictionary is loaded
+    \\automatically (saved in zrtt_viewer_cfg.ini).
+    \\
+    \\Examples:
+    \\  zRttViewer log_dictionary.json              # Live mode with JLinkRTTLogger
+    \\  zRttViewer log_dictionary.json --file rtt.bin  # Decode from file
+    \\  zRttViewer                                     # Reuse last dictionary
+    \\  zRttViewer --raw                               # Raw text mode (no decoding)
+    \\
+;
+
+const Config = struct {
+    dictionary_path: ?[]const u8 = null,
+    file_path: ?[]const u8 = null,
+    show_help: bool = false,
+    raw_mode: bool = false,
+};
+
+fn parseArgs(args: []const []const u8) !Config {
+    var config = Config{};
+
+    var i: usize = 1; // Skip program name
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            config.show_help = true;
+            return config;
+        } else if (std.mem.eql(u8, arg, "--raw")) {
+            config.raw_mode = true;
+        } else if (std.mem.eql(u8, arg, "--file")) {
+            if (i + 1 >= args.len) {
+                return error.MissingFileArgument;
+            }
+            i += 1;
+            config.file_path = args[i];
+        } else if (!std.mem.startsWith(u8, arg, "-")) {
+            if (config.dictionary_path == null) {
+                config.dictionary_path = arg;
+            } else {
+                return error.UnexpectedArgument;
+            }
+        } else {
+            return error.UnknownOption;
+        }
+    }
+
+    return config;
+}
+
+/// Get the directory containing the executable
+fn getExeDir(buf: *[std.fs.max_path_bytes]u8) ?[]const u8 {
+    const exe_path = std.fs.selfExePath(buf) catch return null;
+    return std.fs.path.dirname(exe_path);
+}
+
+/// Build full path to config file next to the executable
+fn getCfgPath(allocator: std.mem.Allocator) ?[]const u8 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = getExeDir(&buf) orelse return null;
+    return std.fs.path.join(allocator, &.{ dir, cfg_file }) catch null;
+}
+
+/// Save dictionary path to config file for future reuse
+fn saveLastDictionary(allocator: std.mem.Allocator, path: []const u8) void {
+    const full_path = getCfgPath(allocator) orelse return;
+    defer allocator.free(full_path);
+    const file = std.fs.createFileAbsolute(full_path, .{}) catch return;
+    defer file.close();
+    file.writeAll(path) catch return;
+}
+
+/// Load last used dictionary path from config file
+fn loadLastDictionary(allocator: std.mem.Allocator) ?[]const u8 {
+    const full_path = getCfgPath(allocator) orelse return null;
+    defer allocator.free(full_path);
+    const file = std.fs.openFileAbsolute(full_path, .{}) catch return null;
+    defer file.close();
+    const content = file.readToEndAlloc(allocator, 4096) catch return null;
+    // Trim trailing whitespace/newlines
+    const trimmed = std.mem.trimRight(u8, content, " \t\r\n");
+    if (trimmed.len == 0) {
+        allocator.free(content);
+        return null;
+    }
+    if (trimmed.len == content.len) return content;
+    // Shrink allocation to trimmed size
+    allocator.free(content);
+    return allocator.dupe(u8, trimmed) catch null;
+}
 
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -9,28 +114,147 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    var defmt_file: []const u8 = undefined;
+    const config = parseArgs(args) catch |err| {
+        std.debug.print("{s}", .{usage});
+        std.debug.print("\nError: {}\n", .{err});
+        std.process.exit(1);
+    };
 
-    if (args.len != 2) {
-        //        std.log.warn("Single arg is expected", .{});
-        //std.process.exit(1);
-        //TODO
-        defmt_file = "/Users/anthony/dev/ziglang/zig_on_stm32wb50/src/cfg/logging_defmt_cfg.zig";
-    } else {
-        defmt_file = args[1];
+    if (config.show_help) {
+        std.debug.print("{s}", .{usage});
+        return;
     }
 
-    // TODO loadDefmtConfigFile(defmt_file);
+    if (config.raw_mode) {
+        std.debug.print("Raw text mode (no decoding)\n", .{});
+        if (config.file_path) |file_path| {
+            try runFileModeRaw(file_path);
+        } else {
+            try runLiveModeRaw(allocator);
+        }
+        return;
+    }
 
+    // Resolve dictionary path: from argument or from last saved config
+    const dict_path = config.dictionary_path orelse loadLastDictionary(allocator) orelse {
+        std.debug.print("{s}", .{usage});
+        std.debug.print("\nError: No dictionary specified and no previous dictionary found.\n", .{});
+        std.debug.print("Run once with a dictionary path to save it for future use.\n", .{});
+        std.process.exit(1);
+    };
+
+    // Load dictionary
+    var dictionary = Dictionary.load(allocator, dict_path) catch |err| {
+        std.debug.print("Error loading dictionary '{s}': {}\n", .{ dict_path, err });
+        std.process.exit(1);
+    };
+    defer dictionary.deinit();
+
+    // Save the dictionary path for future reuse
+    saveLastDictionary(allocator, dict_path);
+
+    std.debug.print("Loaded dictionary from: {s}\n", .{dict_path});
+
+    // Initialize frame decoder
+    var frame_decoder = FrameDecoder.init(allocator, &dictionary);
+
+    if (config.file_path) |file_path| {
+        // File mode: Read from binary log file
+        try runFileMode(allocator, &frame_decoder, file_path);
+    } else {
+        // Live mode: Spawn JLinkRTTLogger and decode stream
+        try runLiveMode(allocator, &frame_decoder);
+    }
+}
+
+fn runFileMode(allocator: std.mem.Allocator, frame_decoder: *FrameDecoder, file_path: []const u8) !void {
+    std.debug.print("Reading from file: {s}\n\n", .{file_path});
+
+    const file = std.fs.cwd().openFile(file_path, .{}) catch |err| {
+        std.debug.print("Error opening file '{s}': {}\n", .{ file_path, err });
+        std.process.exit(1);
+    };
+    defer file.close();
+
+    var byte_buf: [1]u8 = undefined;
+
+    while (true) {
+        const bytes_read = file.read(&byte_buf) catch |err| {
+            std.debug.print("Read error: {}\n", .{err});
+            break;
+        };
+
+        if (bytes_read == 0) break; // EOF
+
+        if (try frame_decoder.processByte(byte_buf[0])) |frame| {
+            if (frame.message.len == 0) {
+                // Unknown message ID
+                output.printUnknownId(frame.raw_id, frame.timestamp, frame.level);
+            } else {
+                output.formatOutput(frame, frame_decoder.dictionary.max_location_len);
+                // Free formatted message if it was allocated (has arguments)
+                const dict_msg = frame_decoder.dictionary.lookup(frame.raw_id);
+                if (dict_msg) |msg| {
+                    if (frame.message.ptr != msg.fmt.ptr) {
+                        allocator.free(frame.message);
+                    }
+                }
+            }
+        }
+    }
+
+    std.debug.print("\nEnd of file.\n", .{});
+}
+
+fn drainLogFile(allocator: std.mem.Allocator, loggerFile: std.fs.File, frame_decoder: *FrameDecoder) !void {
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = loggerFile.read(&buf) catch break;
+        if (n == 0) break;
+
+        for (buf[0..n]) |byte| {
+            if (try frame_decoder.processByte(byte)) |frame| {
+                if (frame.message.len == 0) {
+                    output.printUnknownId(frame.raw_id, frame.timestamp, frame.level);
+                } else {
+                    output.formatOutput(frame, frame_decoder.dictionary.max_location_len);
+                    const dict_msg = frame_decoder.dictionary.lookup(frame.raw_id);
+                    if (dict_msg) |msg| {
+                        if (frame.message.ptr != msg.fmt.ptr) {
+                            allocator.free(frame.message);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn runLiveMode(allocator: std.mem.Allocator, frame_decoder: *FrameDecoder) !void {
     std.debug.print(" ------------------------------------------------------------ \n", .{});
     std.debug.print("| Launch JLinkRTTLogger...                                   |\n", .{});
     std.debug.print(" ------------------------------------------------------------ \n\n", .{});
 
-    const log_file_path = "/Users/anthony/dev/rtt_temp/rtt.log";
+    const log_file_path = "/tmp/zRttViewer_rtt.log";
 
-    //OK const argv = [_][]const u8{ "JLinkRTTLogger", "-device", "STM32WB55RG", "-if", "swd", "-speed", "4000", "-RTTSearchRanges", "0x20000000 0x0000", "-RTTChannel", "0" };
-    const argv = [_][]const u8{ "JLinkRTTLogger", "-device", "STM32WB55RG", "-if", "swd", "-speed", "4000", "-RTTChannel", "0", log_file_path };
-    //JLinkRTTLogger -device STM32WB55RG -if swd -speed 4000 -RTTChannel 0
+    // Create or truncate the log file
+    {
+        const f = try std.fs.createFileAbsolute(log_file_path, .{ .truncate = true });
+        f.close();
+    }
+
+    const argv = [_][]const u8{
+        "JLinkRTTLogger",
+        "-device",
+        "STM32WB55RG",
+        "-if",
+        "swd",
+        "-speed",
+        "4000",
+        "-RTTChannel",
+        "0",
+        log_file_path,
+    };
 
     var child = std.process.Child.init(&argv, allocator);
     child.stdin_behavior = .Inherit;
@@ -39,104 +263,196 @@ pub fn main() !void {
 
     try child.spawn();
 
-    // const max_output_size = 400 * 1024;
-    // const stdout = child.stdout.?.reader().readAllAlloc(allocator, max_output_size) catch {
-    //     return error.ReadFailure;
-    // };
-    // errdefer allocator.free(stdout);
-    var array_list = std.ArrayList(u8).init(allocator);
-    defer array_list.deinit();
+    var array_list = std.ArrayListUnmanaged(u8){};
+    defer array_list.deinit(allocator);
 
-    var skipTansferRate = false;
+    var skipTransferRate = false;
     var loggerInitOk = false;
-    var loggerFile = try std.fs.openFileAbsolute(log_file_path, .{ .mode = .read_only });
+    const loggerFile = try std.fs.openFileAbsolute(log_file_path, .{ .mode = .read_only });
     defer loggerFile.close();
 
-    var buffered_file = std.io.bufferedReader(loggerFile.reader());
-
-    var byte_read: [1]u8 = undefined;
-
     if (child.stdout) |stdout| {
-        var stdout_stream = stdout.reader();
+        var poll_fds = [_]std.posix.pollfd{
+            .{ .fd = stdout.handle, .events = std.posix.POLL.IN, .revents = 0 },
+        };
+
         while (true) {
-            if (stdout_stream.readByte()) |byte| {
+            poll_fds[0].revents = 0;
+            const poll_result = std.posix.poll(&poll_fds, 10) catch 0;
 
-                // Skip "\rTransfer rate: 0 Bytes/s Data written: 0 Bytes "
-                if (byte == '\r') {
-
-                    // If we receive transfer rate info => init is ok
-                    loggerInitOk = true;
-
-                    skipTansferRate = true;
+            if (poll_result > 0) {
+                // Check for hangup (process exited)
+                if (poll_fds[0].revents & std.posix.POLL.HUP != 0) {
+                    if (loggerInitOk) try drainLogFile(allocator, loggerFile, frame_decoder);
+                    break;
                 }
 
-                if (skipTansferRate == true) {
-                    try array_list.append(byte);
-                    const len = array_list.items.len;
+                // Read available stdout data
+                if (poll_fds[0].revents & std.posix.POLL.IN != 0) {
+                    var stdout_buf: [256]u8 = undefined;
+                    const n = stdout.read(&stdout_buf) catch break;
+                    if (n == 0) break;
 
-                    // We received the last
-                    if (len >= 6 and std.mem.eql(u8, array_list.items[len - 6 .. len], "Bytes ")) {
-                        skipTansferRate = false;
-                        array_list.clearAndFree();
-                    }
-                } else {
-
-                    // It's not a text to skip => print each caracter in the console
-                    std.debug.print("{c}", .{byte});
-                }
-
-                // It's not necesserary to launch an another process
-                // Just read the new data in rtt.log file
-                if (loggerInitOk) {
-                    while (true) {
-                        const number_of_read_bytes = try buffered_file.read(&byte_read);
-
-                        if (number_of_read_bytes == 0) {
-                            break; // No more data
+                    for (stdout_buf[0..n]) |byte| {
+                        // Skip "\rTransfer rate: 0 Bytes/s Data written: 0 Bytes "
+                        if (byte == '\r') {
+                            loggerInitOk = true;
+                            skipTransferRate = true;
                         }
 
-                        // Buffer now has some of the file bytes, do something with it here...
-                        std.debug.print("{c}", .{byte_read[0]});
+                        if (skipTransferRate) {
+                            try array_list.append(allocator, byte);
+                            const len = array_list.items.len;
 
-                        //TODO decode deferred log
+                            if (len >= 6 and std.mem.eql(u8, array_list.items[len - 6 .. len], "Bytes ")) {
+                                skipTransferRate = false;
+                                array_list.clearAndFree(allocator);
+                            }
+                        } else {
+                            std.debug.print("{c}", .{byte});
+                        }
                     }
                 }
-            } else |_| {
-                break;
+            }
+
+            // Read log file data on every iteration (data available or timeout)
+            if (loggerInitOk) {
+                try drainLogFile(allocator, loggerFile, frame_decoder);
             }
         }
-        // while (try stdout_stream.readUntilDelimiterOrEofAlloc(allocator, '\n', 4096 * 1000)) |line| {
-        //     std.debug.print("tutu:{s}\n", .{line});
-        // }
     }
 
     const exit_status = try child.wait();
-
-    std.debug.print("Exit status: {d}\n", .{exit_status.Exited});
+    std.debug.print("JLinkRTTLogger exit status: {d}\n", .{exit_status.Exited});
 }
 
-// fn loadDefmtConfigFile(cfg_file: []const u8 ) void
-// {
-//     // Try to load the logging_defmt_cfg.zig which contain the deffered log Id
-//     const file = try std.fs.cwd().openFile(defmt_file, .{});
-//     defer file.close();
+fn runFileModeRaw(file_path: []const u8) !void {
+    std.debug.print("Reading raw from file: {s}\n\n", .{file_path});
 
-//     var buffered = std.io.bufferedReader(file.reader());
-//     var reader = buffered.reader();
+    const file = std.fs.cwd().openFile(file_path, .{}) catch |err| {
+        std.debug.print("Error opening file '{s}': {}\n", .{ file_path, err });
+        std.process.exit(1);
+    };
+    defer file.close();
 
-//     // lines will get read into this
-//     var arr = std.ArrayList(u8).init(allocator);
-//     defer arr.deinit();
+    const stdout = std.fs.File.stdout();
+    var buf: [4096]u8 = undefined;
 
-//     var line_count: usize = 0;
-//     var byte_count: usize = 0;
-//     while (true) {
-//         reader.streamUntilDelimiter(arr.writer(), '\n', null) catch |err| switch (err) {
-//         error.EndOfStream => break,
-//         else => return err,
-//         };
-//         line_count += 1;
-//         byte_count += arr.items.len;
-//         arr.clearRetainingCapacity();
-//     }
-// }
+    while (true) {
+        const n = file.read(&buf) catch |err| {
+            std.debug.print("Read error: {}\n", .{err});
+            break;
+        };
+        if (n == 0) break;
+        stdout.writeAll(buf[0..n]) catch break;
+    }
+
+    std.debug.print("\nEnd of file.\n", .{});
+}
+
+fn runLiveModeRaw(allocator: std.mem.Allocator) !void {
+    std.debug.print(" ------------------------------------------------------------ \n", .{});
+    std.debug.print("| Launch JLinkRTTLogger (raw text mode)...                    |\n", .{});
+    std.debug.print(" ------------------------------------------------------------ \n\n", .{});
+
+    const log_file_path = "/tmp/zRttViewer_rtt.log";
+
+    // Create or truncate the log file
+    {
+        const f = try std.fs.createFileAbsolute(log_file_path, .{ .truncate = true });
+        f.close();
+    }
+
+    const argv = [_][]const u8{
+        "JLinkRTTLogger",
+        "-device",
+        "STM32WB55RG",
+        "-if",
+        "swd",
+        "-speed",
+        "4000",
+        "-RTTChannel",
+        "0",
+        log_file_path,
+    };
+
+    var child = std.process.Child.init(&argv, allocator);
+    child.stdin_behavior = .Inherit;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Inherit;
+
+    try child.spawn();
+
+    var array_list = std.ArrayListUnmanaged(u8){};
+    defer array_list.deinit(allocator);
+
+    var skipTransferRate = false;
+    var loggerInitOk = false;
+    const loggerFile = try std.fs.openFileAbsolute(log_file_path, .{ .mode = .read_only });
+    defer loggerFile.close();
+
+    const stdout = std.fs.File.stdout();
+
+    if (child.stdout) |child_stdout| {
+        var poll_fds = [_]std.posix.pollfd{
+            .{ .fd = child_stdout.handle, .events = std.posix.POLL.IN, .revents = 0 },
+        };
+
+        while (true) {
+            poll_fds[0].revents = 0;
+            const poll_result = std.posix.poll(&poll_fds, 10) catch 0;
+
+            if (poll_result > 0) {
+                if (poll_fds[0].revents & std.posix.POLL.HUP != 0) {
+                    if (loggerInitOk) {
+                        var buf: [4096]u8 = undefined;
+                        while (true) {
+                            const n = loggerFile.read(&buf) catch break;
+                            if (n == 0) break;
+                            stdout.writeAll(buf[0..n]) catch break;
+                        }
+                    }
+                    break;
+                }
+
+                if (poll_fds[0].revents & std.posix.POLL.IN != 0) {
+                    var stdout_buf: [256]u8 = undefined;
+                    const n = child_stdout.read(&stdout_buf) catch break;
+                    if (n == 0) break;
+
+                    for (stdout_buf[0..n]) |byte| {
+                        if (byte == '\r') {
+                            loggerInitOk = true;
+                            skipTransferRate = true;
+                        }
+
+                        if (skipTransferRate) {
+                            try array_list.append(allocator, byte);
+                            const len = array_list.items.len;
+
+                            if (len >= 6 and std.mem.eql(u8, array_list.items[len - 6 .. len], "Bytes ")) {
+                                skipTransferRate = false;
+                                array_list.clearAndFree(allocator);
+                            }
+                        } else {
+                            std.debug.print("{c}", .{byte});
+                        }
+                    }
+                }
+            }
+
+            // Dump raw log file content
+            if (loggerInitOk) {
+                var buf: [4096]u8 = undefined;
+                while (true) {
+                    const n = loggerFile.read(&buf) catch break;
+                    if (n == 0) break;
+                    stdout.writeAll(buf[0..n]) catch break;
+                }
+            }
+        }
+    }
+
+    const exit_status = try child.wait();
+    std.debug.print("JLinkRTTLogger exit status: {d}\n", .{exit_status.Exited});
+}

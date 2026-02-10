@@ -87,15 +87,6 @@ pub fn printUnknownId(id: u32, timestamp: u32, level: decoder.LogLevel) void {
     });
 }
 
-/// Print an error message for malformed frame
-pub fn printMalformedFrame(reason: []const u8) void {
-    std.debug.print("{s}[ERROR] Malformed frame: {s}{s}\n", .{
-        Colors.err,
-        reason,
-        Colors.reset,
-    });
-}
-
 test "getLogLevelString returns correct strings" {
     try std.testing.expectEqualStrings("DEBUG", getLogLevelString(.debug));
     try std.testing.expectEqualStrings("INFO ", getLogLevelString(.info));
